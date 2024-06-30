@@ -1,0 +1,273 @@
+# yamllint disable rule:line-length
+# TODO(rushy_panchal): Reorder more intuitively. Place the most important resources at the top.
+---
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: Infrastructure for backing up Google Drive to an S3 bucket on a cron-like schedule.
+
+Parameters:
+  BackupSchedule:
+    Type: String
+    Description: Cron expression for running backup.
+    Default: cron(0 0 ? * * *)
+
+  RcloneImage:
+    Type: String
+    Description: Public URL to rclone image
+    Default: public.ecr.aws/bitnami/rclone:1.67.0
+
+  RcloneMemory:
+    Type: String
+    Description: Memory, in MiB, to assign to the rclone task and container.
+    Default: 2048
+
+  RcloneCPU:
+    Type: String
+    Description: CPU, in vCPU units, to assign to the rclone task and container.
+    Default: 1024
+
+Resources:
+  # IAM policies and roles.
+  IAMPolicyAllowS3Backups:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: !Sub "Allows S3 operations on the bucket ${S3BucketGDriveBackups}."
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Resource:
+              - !Sub "arn:aws:s3:::${S3BucketGDriveBackups}/*"
+              - !Sub "arn:aws:s3:::${S3BucketGDriveBackups}"
+            Action:
+              - s3:PutObject
+              - s3:GetObject
+              - s3:ListAllMyBuckets
+              - s3:ListBucket
+              - s3:DeleteObject
+              - s3:PutObjectAcl
+            Effect: Allow
+
+  IAMRoleGDriveBackup:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+        - !Ref IAMPolicyAllowS3Backups
+      MaxSessionDuration: 3600
+      Description: IAM role to backup Google Drive onto S3.
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+
+  IAMPolicyAllowS3ReadBackupConfig:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Allows reading the Google Drive backup configuration from S3.
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Resource: !Sub "arn:aws:s3:::${S3BucketGDriveBackups}"
+            Action: s3:GetBucketLocation
+            Effect: Allow
+          - Resource: !Sub "arn:aws:s3:::${S3BucketGDriveBackups}/config/rclone.env"
+            Action: s3:GetObject
+            Effect: Allow
+
+  IAMRoleGDriveBackupTaskExecutor:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+        - !Ref IAMPolicyAllowS3ReadBackupConfig
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      MaxSessionDuration: 3600
+      Description: Allows ECS tasks to call AWS services on your behalf.
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+
+  IAMRoleECSEvents:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceEventsRole
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+
+  # S3 bucket for storing backups and configuration.
+  S3BucketGDriveBackups:
+    Type: AWS::S3::Bucket
+    # TODO(rushy_panchal): Change to Retain.
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      PublicAccessBlockConfiguration:
+        RestrictPublicBuckets: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        BlockPublicAcls: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - BucketKeyEnabled: true
+            ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+              NewerNoncurrentVersions: 25
+      VersioningConfiguration:
+        Status: Enabled
+
+  # ECS cluster.
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      CapacityProviders:
+        - FARGATE_SPOT
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE_SPOT
+          Base: 0
+          Weight: 1
+      ClusterSettings:
+        - Name: containerInsights
+          Value: disabled
+      Configuration:
+        ExecuteCommandConfiguration:
+          Logging: DEFAULT
+      ServiceConnectDefaults:
+        Namespace: default
+
+  # ECS task to perform backups.
+  ECSTaskDefinitionGDriveBackup:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Ref AWS::StackName
+      TaskRoleArn: !GetAtt IAMRoleGDriveBackup.Arn
+      ExecutionRoleArn: !GetAtt IAMRoleGDriveBackupTaskExecutor.Arn
+      Memory: !Ref RcloneMemory
+      Cpu: !Ref RcloneCPU
+      RequiresCompatibilities:
+        - FARGATE
+      NetworkMode: awsvpc
+      RuntimePlatform:
+        OperatingSystemFamily: LINUX
+        CpuArchitecture: X86_64
+      ContainerDefinitions:
+        - Name: rclone
+          Image: !Ref RcloneImage
+          Memory: !Ref RcloneMemory
+          Cpu: !Ref RcloneCPU
+          Essential: true
+          LogConfiguration:
+            Options:
+              awslogs-group: !Sub "/${AWS::StackName}"
+              awslogs-create-group: true
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+            LogDriver: awslogs
+          EnvironmentFiles:
+            - Value: !Sub "arn:aws:s3:::${S3BucketGDriveBackups}/config/rclone.env"
+              Type: s3
+          EntryPoint:
+            - rclone
+          Command:
+            - sync
+            - --combined
+            - "-"
+            - "drive:"
+            - !Sub "s3:${S3BucketGDriveBackups}/backups"
+
+  # Logging for ECS task.
+  LogGroupECSTask:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/${AWS::StackName}"
+      LogGroupClass: STANDARD
+      RetentionInDays: 14
+
+  # EC2 networking.
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 172.31.0.0/26
+      EnableDnsSupport: true
+      InstanceTenancy: default
+
+  SubnetAZ1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone:
+        Fn::Select:
+        - 0
+        - !GetAZs ""
+      MapPublicIpOnLaunch: true
+      CidrBlock: 172.31.0.0/28
+      Ipv6Native: false
+
+  SubnetAZ2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone:
+        Fn::Select:
+        - 1
+        - !GetAZs ""
+      MapPublicIpOnLaunch: true
+      CidrBlock: 172.31.0.16/28
+      Ipv6Native: false
+
+  SubnetAZ3:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone:
+        Fn::Select:
+        - 2
+        - !GetAZs ""
+      MapPublicIpOnLaunch: true
+      CidrBlock: 172.31.0.32/28
+      Ipv6Native: false
+
+  # Cron setup.
+  EventRuleCronGDriveBackup:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Cron job to back up from Google Drive.
+      ScheduleExpression: !Ref BackupSchedule
+      State: ENABLED
+      Targets:
+      - Id: !Sub "${AWS::StackName}-backup-cron"
+        Arn: !GetAtt ECSCluster.Arn
+        # Do not retry, as it's a cron job and will get auto-triggered again.
+        RetryPolicy:
+          MaximumRetryAttempts: 0
+        RoleArn: !GetAtt IAMRoleECSEvents.Arn
+        EcsParameters:
+          TaskDefinitionArn: !Ref ECSTaskDefinitionGDriveBackup
+          TaskCount: 1
+          PlatformVersion: LATEST
+          NetworkConfiguration:
+            AwsVpcConfiguration:
+              AssignPublicIp: ENABLED
+              Subnets:
+              - !Ref SubnetAZ1
+              - !Ref SubnetAZ2
+              - !Ref SubnetAZ3
