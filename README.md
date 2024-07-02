@@ -8,15 +8,31 @@ It currently supports creating the following:
 * An S3 bucket to store backups in,
 * An ECS task running `rclone` to perform the backup,
 * An Event rule that triggers the above ECS task on a cron schedule,
-* and all of the IAM roles, subnets, and the VPC to support this.
+* A logging group that the ECS task logs to,
+* and all of the IAM roles and networking to support this.
 
 Backups are stored under the `/backup` prefix in the bucket.
 
+## Quick Start
+Deploy the stack using the AWS CLI:
+
+```
+aws cloudformation create-stack --stack-name drive-backup --capabilities CAPABILITY_IAM --template-body file://stack.yml
+```
+
+Note that `--capabilities CAPABILITY_IAM` is required becaues the template creates IAM roles and policies.
+
+Once the stack is created, you can add the configuration below.
+
 ## Configuration
-Note that you will need a configuration file stored in the S3 bucket created by the stack, under the path
+
+You will need a configuration file stored in the S3 bucket created by the stack, under the path
+
 ```
 /config/rclone.env
 ```
+
+*Without the configuration, backups will not be performed.*
 
 The file should be of the format:
 
